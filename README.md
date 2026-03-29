@@ -2,7 +2,7 @@
 
 One-click deploy [Hermes Agent](https://github.com/nousresearch/hermes-agent) on [Railway](https://railway.app) with a web-based config UI and status dashboard.
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/template/hermes-agent)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/hermes-agent)
 
 ## What you get
 
