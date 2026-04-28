@@ -651,6 +651,57 @@ async def api_files_read(request: Request):
     return JSONResponse({"path": rel, "content": content, "size": size})
 
 
+async def api_files_save(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    relpath = body.get("path", "")
+    if not isinstance(relpath, str):
+        relpath = ""
+    content = body.get("content", "")
+    if not isinstance(content, str):
+        return JSONResponse({"error": "content must be a string"}, status_code=400)
+
+    if len(content.encode("utf-8")) > FILES_MAX_READ_BYTES:
+        return JSONResponse(
+            {"error": f"Content too large (max {FILES_MAX_READ_BYTES} bytes)"},
+            status_code=413,
+        )
+
+    abs_path, err = resolve_safe_relpath(relpath)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+    if abs_path.exists() and not abs_path.is_file():
+        return JSONResponse({"error": "Not a file"}, status_code=400)
+
+    def write_sync() -> str | None:
+        try:
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.write_bytes(content.encode("utf-8"))
+        except OSError as e:
+            return str(e)
+        return None
+
+    try:
+        write_err = await asyncio.to_thread(write_sync)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    if write_err:
+        return JSONResponse({"error": write_err}, status_code=500)
+
+    rel = str(abs_path.relative_to(HERMES_ROOT)) if abs_path != HERMES_ROOT else ""
+    try:
+        new_size = abs_path.stat().st_size
+    except OSError:
+        new_size = len(content.encode("utf-8"))
+    return JSONResponse({"ok": True, "path": rel, "size": new_size})
+
+
 async def auto_start_gateway():
     env_vars = read_env_file(ENV_FILE_PATH)
     has_provider = any(env_vars.get(key) for key in PROVIDER_KEYS)
@@ -675,6 +726,7 @@ routes = [
     Route("/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
     Route("/api/files/list", api_files_list),
     Route("/api/files/read", api_files_read),
+    Route("/api/files/save", api_files_save, methods=["POST"]),
 ]
 
 @asynccontextmanager
