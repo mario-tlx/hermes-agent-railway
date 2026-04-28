@@ -349,7 +349,7 @@
     <div x-show="tab === 'files'">
       <div class="space-y-6">
         <p class="text-sm text-gray-500 dark:text-gray-400">
-          Browse folders and files under the Hermes data directory (<code class="text-xs bg-gray-100 dark:bg-gray-800 px-1 rounded">HERMES_HOME</code>). View only; max file size for preview is 512&nbsp;KB.
+          Browse and edit files under the Hermes data directory (<code class="text-xs bg-gray-100 dark:bg-gray-800 px-1 rounded">HERMES_HOME</code>). Max size per read/write is 512&nbsp;KB. UTF-8 only. Mis-editing <code class="text-xs">.env</code> or <code class="text-xs">config.yaml</code> can break the gateway — restart after changes if needed.
         </p>
 
         <section>
@@ -397,14 +397,31 @@
             </div>
 
             <div class="bg-white border border-gray-200 dark:bg-gray-900 dark:border-gray-800 rounded-xl overflow-hidden flex flex-col min-h-[280px]">
-              <div class="px-4 py-2 border-b border-gray-200 dark:border-gray-800 text-xs font-medium text-gray-500 uppercase tracking-wide">File preview</div>
-              <div x-show="!filePreview.path && !filePreview.loading && !filePreview.error" class="px-4 py-8 text-center text-gray-400 text-sm flex-1">Select a file to preview</div>
+              <div class="px-4 py-2 border-b border-gray-200 dark:border-gray-800 flex flex-wrap items-center justify-between gap-2">
+                <span class="text-xs font-medium text-gray-500 uppercase tracking-wide">File editor</span>
+                <div class="flex flex-wrap gap-2" x-show="filePreview.path && !filePreview.loading && !filePreview.error">
+                  <button type="button" @click="revertFileEdit()" :disabled="!filePreviewDirty || filePreview.saving"
+                          class="text-xs px-3 py-1.5 rounded-lg bg-gray-200 hover:bg-gray-300 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-gray-200 disabled:opacity-50">
+                    Revert
+                  </button>
+                  <button type="button" @click="saveFileContent()" :disabled="!filePreviewDirty || filePreview.saving"
+                          class="text-xs px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white disabled:opacity-50">
+                    <span x-show="!filePreview.saving">Save</span>
+                    <span x-show="filePreview.saving">Saving…</span>
+                  </button>
+                </div>
+              </div>
+              <div x-show="!filePreview.path && !filePreview.loading && !filePreview.error" class="px-4 py-8 text-center text-gray-400 text-sm flex-1">Select a file to edit</div>
               <div x-show="filePreview.loading" class="px-4 py-8 text-center text-gray-400 text-sm flex-1">Loading…</div>
               <div x-show="filePreview.error" class="px-4 py-4 text-sm text-red-600 dark:text-red-400 flex-1" x-text="filePreview.error"></div>
-              <div x-show="filePreview.path && !filePreview.loading && !filePreview.error" class="flex-1 flex flex-col min-h-0 p-4">
-                <p class="text-xs text-gray-500 mb-2 font-mono break-all" x-text="filePreview.path"></p>
-                <p class="text-xs text-gray-400 mb-2" x-text="'Size: ' + formatFileSize(filePreview.size)"></p>
-                <pre class="log-viewer flex-1 overflow-auto bg-gray-100 dark:bg-gray-950 rounded-lg p-3 text-xs text-gray-800 dark:text-gray-200 whitespace-pre-wrap break-words max-h-[480px]" x-text="filePreview.content"></pre>
+              <div x-show="filePreview.path && !filePreview.loading && !filePreview.error" class="flex-1 flex flex-col min-h-0 p-4 gap-2">
+                <div class="flex flex-wrap items-baseline justify-between gap-2">
+                  <p class="text-xs text-gray-500 font-mono break-all" x-text="filePreview.path"></p>
+                  <span class="text-xs shrink-0" :class="filePreviewDirty ? 'text-amber-600 dark:text-amber-400' : 'text-gray-400'" x-text="filePreviewDirty ? 'Unsaved changes' : 'Saved'"></span>
+                </div>
+                <p class="text-xs text-gray-400" x-text="'Size on disk: ' + formatFileSize(filePreview.size)"></p>
+                <textarea x-model="filePreview.draft" spellcheck="false"
+                          class="log-viewer flex-1 w-full min-h-[240px] max-h-[480px] resize-y bg-gray-100 dark:bg-gray-950 border border-gray-300 dark:border-gray-700 rounded-lg p-3 text-xs text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500"></textarea>
               </div>
             </div>
           </div>
@@ -546,7 +563,12 @@
         filesEntries: [],
         filesLoading: false,
         filesListError: '',
-        filePreview: { path: '', content: '', size: 0, loading: false, error: '' },
+        filePreview: { path: '', draft: '', baseline: '', size: 0, loading: false, error: '', saving: false },
+
+        get filePreviewDirty() {
+          const fp = this.filePreview;
+          return !!(fp.path && !fp.loading && fp.draft !== fp.baseline);
+        },
 
         get filesPathSegments() {
           return this.filesPath ? this.filesPath.split('/').filter(Boolean) : [];
@@ -769,7 +791,7 @@
         },
 
         async loadFilePreview(relpath) {
-          this.filePreview = { path: '', content: '', size: 0, loading: true, error: '' };
+          this.filePreview = { path: '', draft: '', baseline: '', size: 0, loading: true, error: '', saving: false };
           const q = `?path=${encodeURIComponent(relpath)}`;
           try {
             const res = await fetch(`/api/files/read${q}`);
@@ -777,29 +799,66 @@
             if (!res.ok) {
               this.filePreview = {
                 path: relpath,
-                content: '',
+                draft: '',
+                baseline: '',
                 size: data.size ?? 0,
                 loading: false,
                 error: data.error || `Read failed (${res.status})`,
+                saving: false,
               };
               return;
             }
+            const text = data.content ?? '';
             this.filePreview = {
               path: data.path || relpath,
-              content: data.content ?? '',
+              draft: text,
+              baseline: text,
               size: data.size ?? 0,
               loading: false,
               error: '',
+              saving: false,
             };
           } catch (e) {
             this.filePreview = {
               path: relpath,
-              content: '',
+              draft: '',
+              baseline: '',
               size: 0,
               loading: false,
               error: e.message || 'Read failed',
+              saving: false,
             };
           }
+        },
+
+        revertFileEdit() {
+          if (!this.filePreview.path) return;
+          this.filePreview.draft = this.filePreview.baseline;
+        },
+
+        async saveFileContent() {
+          if (!this.filePreview.path || this.filePreview.saving) return;
+          this.filePreview.saving = true;
+          try {
+            const res = await fetch('/api/files/save', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: this.filePreview.path, content: this.filePreview.draft }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              this.showToast(data.error || `Save failed (${res.status})`, 'error');
+              this.filePreview.saving = false;
+              return;
+            }
+            this.filePreview.baseline = this.filePreview.draft;
+            this.filePreview.size = data.size ?? this.filePreview.size;
+            this.showToast('File saved', 'success');
+            await this.loadFilesList(this.filesPath);
+          } catch (e) {
+            this.showToast('Save failed: ' + e.message, 'error');
+          }
+          this.filePreview.saving = false;
         },
 
         formatDate(ts) {
