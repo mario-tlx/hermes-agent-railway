@@ -9,6 +9,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import unquote
 
 from starlette.applications import Starlette
 from starlette.authentication import (
@@ -38,7 +39,9 @@ if not ADMIN_PASSWORD:
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE_PATH = Path(HERMES_HOME) / ".env"
 PAIRING_DIR = Path(HERMES_HOME) / "pairing"
+HERMES_ROOT = Path(HERMES_HOME).expanduser().resolve()
 CODE_TTL_SECONDS = 3600
+FILES_MAX_READ_BYTES = 512 * 1024
 
 # Registry of known Hermes env vars exposed in the UI.
 # Each entry: (key, label, category, is_password)
@@ -551,6 +554,103 @@ async def api_pairing_revoke(request: Request):
     return JSONResponse({"ok": True})
 
 
+def resolve_safe_relpath(relpath: str) -> tuple[Path | None, str | None]:
+    """Resolve a path relative to HERMES_ROOT. Rejects traversal and null bytes."""
+    if not isinstance(relpath, str):
+        relpath = ""
+    raw = unquote(relpath).replace("\\", "/")
+    if "\x00" in raw:
+        return None, "Invalid path"
+    trimmed = raw.strip("/")
+    parts = [p for p in trimmed.split("/") if p and p != "."]
+    if any(p == ".." for p in parts):
+        return None, "Invalid path"
+    candidate = HERMES_ROOT.joinpath(*parts) if parts else HERMES_ROOT
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None, "Invalid path"
+    try:
+        resolved.relative_to(HERMES_ROOT)
+    except ValueError:
+        return None, "Path escapes Hermes home"
+    return resolved, None
+
+
+def _files_list_sync(abs_path: Path) -> dict:
+    entries = []
+    for name in sorted(abs_path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        try:
+            st = name.stat()
+        except OSError:
+            continue
+        entries.append({
+            "name": name.name,
+            "is_dir": name.is_dir(),
+            "size": st.st_size if name.is_file() else None,
+            "mtime": int(st.st_mtime),
+        })
+    return {"path": str(abs_path.relative_to(HERMES_ROOT)) if abs_path != HERMES_ROOT else "", "entries": entries}
+
+
+async def api_files_list(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    relpath = request.query_params.get("path", "")
+    abs_path, err = resolve_safe_relpath(relpath)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+    if not abs_path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    if not abs_path.is_dir():
+        return JSONResponse({"error": "Not a directory"}, status_code=400)
+    try:
+        data = await asyncio.to_thread(_files_list_sync, abs_path)
+    except PermissionError:
+        return JSONResponse({"error": "Permission denied"}, status_code=403)
+    except OSError as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse(data)
+
+
+async def api_files_read(request: Request):
+    auth_err = require_auth(request)
+    if auth_err:
+        return auth_err
+    relpath = request.query_params.get("path", "")
+    abs_path, err = resolve_safe_relpath(relpath)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+    if not abs_path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    if not abs_path.is_file():
+        return JSONResponse({"error": "Not a file"}, status_code=400)
+
+    def read_sync() -> tuple[str | None, str | None, int | None]:
+        try:
+            size = abs_path.stat().st_size
+        except OSError as e:
+            return None, str(e), None
+        if size > FILES_MAX_READ_BYTES:
+            return None, f"File too large (max {FILES_MAX_READ_BYTES} bytes)", size
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return None, str(e), size
+        return text, None, size
+
+    try:
+        content, read_err, size = await asyncio.to_thread(read_sync)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    if read_err:
+        code = 413 if "too large" in read_err else 400
+        return JSONResponse({"error": read_err, "size": size}, status_code=code)
+    rel = str(abs_path.relative_to(HERMES_ROOT)) if abs_path != HERMES_ROOT else ""
+    return JSONResponse({"path": rel, "content": content, "size": size})
+
+
 async def auto_start_gateway():
     env_vars = read_env_file(ENV_FILE_PATH)
     has_provider = any(env_vars.get(key) for key in PROVIDER_KEYS)
@@ -573,6 +673,8 @@ routes = [
     Route("/api/pairing/deny", api_pairing_deny, methods=["POST"]),
     Route("/api/pairing/approved", api_pairing_approved),
     Route("/api/pairing/revoke", api_pairing_revoke, methods=["POST"]),
+    Route("/api/files/list", api_files_list),
+    Route("/api/files/read", api_files_read),
 ]
 
 @asynccontextmanager

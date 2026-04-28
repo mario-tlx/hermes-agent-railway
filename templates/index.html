@@ -49,6 +49,8 @@
       </button>
       <button @click="tab = 'status'" class="px-4 py-2 text-sm font-medium rounded-t-lg transition"
               :class="tab === 'status' ? 'bg-gray-200 text-gray-900 dark:bg-gray-800 dark:text-white' : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'">Status</button>
+      <button @click="tab = 'files'; loadFilesList(filesPath)" class="px-4 py-2 text-sm font-medium rounded-t-lg transition"
+              :class="tab === 'files' ? 'bg-gray-200 text-gray-900 dark:bg-gray-800 dark:text-white' : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'">Files</button>
     </div>
 
     <div x-show="tab === 'config'">
@@ -344,6 +346,72 @@
       </div>
     </div>
 
+    <div x-show="tab === 'files'">
+      <div class="space-y-6">
+        <p class="text-sm text-gray-500 dark:text-gray-400">
+          Browse folders and files under the Hermes data directory (<code class="text-xs bg-gray-100 dark:bg-gray-800 px-1 rounded">HERMES_HOME</code>). View only; max file size for preview is 512&nbsp;KB.
+        </p>
+
+        <section>
+          <div class="flex flex-wrap items-center gap-2 mb-3 text-sm">
+            <button type="button" @click="filesGoRoot()" class="px-2 py-1 rounded-lg bg-gray-200 hover:bg-gray-300 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-gray-200">Root</button>
+            <button type="button" x-show="filesPath" @click="filesGoUp()" class="px-2 py-1 rounded-lg bg-gray-200 hover:bg-gray-300 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-800 dark:text-gray-200">Up</button>
+            <span class="text-gray-400">/</span>
+            <template x-for="(seg, i) in filesPathSegments" :key="i">
+              <span class="flex items-center gap-1">
+                <button type="button" class="text-blue-600 dark:text-blue-400 hover:underline font-mono text-xs"
+                        @click="filesGoToSegment(i)" x-text="seg"></button>
+                <span class="text-gray-400" x-show="i < filesPathSegments.length - 1">/</span>
+              </span>
+            </template>
+            <span x-show="!filesPath" class="text-gray-500 dark:text-gray-400 font-mono text-xs">(root)</span>
+          </div>
+
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div class="bg-white border border-gray-200 dark:bg-gray-900 dark:border-gray-800 rounded-xl overflow-hidden">
+              <div class="px-4 py-2 border-b border-gray-200 dark:border-gray-800 text-xs font-medium text-gray-500 uppercase tracking-wide">Directory</div>
+              <div x-show="filesLoading" class="px-4 py-8 text-center text-gray-400 text-sm">Loading…</div>
+              <div x-show="!filesLoading && filesListError" class="px-4 py-4 text-sm text-red-600 dark:text-red-400" x-text="filesListError"></div>
+              <div x-show="!filesLoading && !filesListError && filesEntries.length === 0" class="px-4 py-8 text-center text-gray-400 text-sm">Empty folder</div>
+              <table x-show="!filesLoading && !filesListError && filesEntries.length > 0" class="w-full text-sm">
+                <thead class="bg-gray-100/50 dark:bg-gray-800/50">
+                  <tr>
+                    <th class="text-left px-4 py-2 text-xs text-gray-500 font-medium">Name</th>
+                    <th class="text-right px-4 py-2 text-xs text-gray-500 font-medium w-24">Size</th>
+                    <th class="text-right px-4 py-2 text-xs text-gray-500 font-medium w-36">Modified</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="ent in filesEntries" :key="ent.name + (ent.is_dir ? '/d' : '/f')">
+                    <tr class="border-t border-gray-200 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50 cursor-pointer"
+                        @click="ent.is_dir ? loadFilesList(filesJoin(filesPath, ent.name)) : loadFilePreview(filesJoin(filesPath, ent.name))">
+                      <td class="px-4 py-2">
+                        <span class="font-mono text-xs" :class="ent.is_dir ? 'text-blue-600 dark:text-blue-400' : ''" x-text="ent.is_dir ? ent.name + '/' : ent.name"></span>
+                      </td>
+                      <td class="px-4 py-2 text-right text-gray-500 font-mono text-xs" x-text="ent.is_dir ? '—' : formatFileSize(ent.size)"></td>
+                      <td class="px-4 py-2 text-right text-gray-500 text-xs" x-text="formatDate(ent.mtime)"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="bg-white border border-gray-200 dark:bg-gray-900 dark:border-gray-800 rounded-xl overflow-hidden flex flex-col min-h-[280px]">
+              <div class="px-4 py-2 border-b border-gray-200 dark:border-gray-800 text-xs font-medium text-gray-500 uppercase tracking-wide">File preview</div>
+              <div x-show="!filePreview.path && !filePreview.loading && !filePreview.error" class="px-4 py-8 text-center text-gray-400 text-sm flex-1">Select a file to preview</div>
+              <div x-show="filePreview.loading" class="px-4 py-8 text-center text-gray-400 text-sm flex-1">Loading…</div>
+              <div x-show="filePreview.error" class="px-4 py-4 text-sm text-red-600 dark:text-red-400 flex-1" x-text="filePreview.error"></div>
+              <div x-show="filePreview.path && !filePreview.loading && !filePreview.error" class="flex-1 flex flex-col min-h-0 p-4">
+                <p class="text-xs text-gray-500 mb-2 font-mono break-all" x-text="filePreview.path"></p>
+                <p class="text-xs text-gray-400 mb-2" x-text="'Size: ' + formatFileSize(filePreview.size)"></p>
+                <pre class="log-viewer flex-1 overflow-auto bg-gray-100 dark:bg-gray-950 rounded-lg p-3 text-xs text-gray-800 dark:text-gray-200 whitespace-pre-wrap break-words max-h-[480px]" x-text="filePreview.content"></pre>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+
     <div x-show="tab === 'status'">
       <div class="space-y-6">
 
@@ -473,6 +541,16 @@
         restartAfterSave: true,
         toast: { show: false, message: '', type: 'success' },
         _pairingInterval: null,
+
+        filesPath: '',
+        filesEntries: [],
+        filesLoading: false,
+        filesListError: '',
+        filePreview: { path: '', content: '', size: 0, loading: false, error: '' },
+
+        get filesPathSegments() {
+          return this.filesPath ? this.filesPath.split('/').filter(Boolean) : [];
+        },
 
         providers: [
           { key: 'OPENROUTER_API_KEY', label: 'OpenRouter' },
@@ -637,6 +715,90 @@
           if (res.ok) {
             this.showToast('User revoked', 'success');
             await this.loadPairing();
+          }
+        },
+
+        filesJoin(parent, name) {
+          return parent ? `${parent}/${name}` : name;
+        },
+
+        filesGoRoot() {
+          this.loadFilesList('');
+        },
+
+        filesGoUp() {
+          if (!this.filesPath) return;
+          const segs = this.filesPathSegments;
+          segs.pop();
+          this.loadFilesList(segs.join('/'));
+        },
+
+        filesGoToSegment(index) {
+          const segs = this.filesPathSegments.slice(0, index + 1);
+          this.loadFilesList(segs.join('/'));
+        },
+
+        formatFileSize(bytes) {
+          if (bytes == null) return '—';
+          const n = Number(bytes);
+          if (Number.isNaN(n)) return '—';
+          if (n < 1024) return `${n} B`;
+          if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+          return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+        },
+
+        async loadFilesList(relpath) {
+          this.filesLoading = true;
+          this.filesListError = '';
+          this.filesEntries = [];
+          const q = relpath ? `?path=${encodeURIComponent(relpath)}` : '';
+          try {
+            const res = await fetch(`/api/files/list${q}`);
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              this.filesListError = data.error || `List failed (${res.status})`;
+              this.filesLoading = false;
+              return;
+            }
+            this.filesPath = data.path || '';
+            this.filesEntries = data.entries || [];
+          } catch (e) {
+            this.filesListError = e.message || 'List failed';
+          }
+          this.filesLoading = false;
+        },
+
+        async loadFilePreview(relpath) {
+          this.filePreview = { path: '', content: '', size: 0, loading: true, error: '' };
+          const q = `?path=${encodeURIComponent(relpath)}`;
+          try {
+            const res = await fetch(`/api/files/read${q}`);
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              this.filePreview = {
+                path: relpath,
+                content: '',
+                size: data.size ?? 0,
+                loading: false,
+                error: data.error || `Read failed (${res.status})`,
+              };
+              return;
+            }
+            this.filePreview = {
+              path: data.path || relpath,
+              content: data.content ?? '',
+              size: data.size ?? 0,
+              loading: false,
+              error: '',
+            };
+          } catch (e) {
+            this.filePreview = {
+              path: relpath,
+              content: '',
+              size: 0,
+              loading: false,
+              error: e.message || 'Read failed',
+            };
           }
         },
 
