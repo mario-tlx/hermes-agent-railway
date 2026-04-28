@@ -1,5 +1,6 @@
 import asyncio
-import base64
+import hashlib
+import io
 import json
 import os
 import re
@@ -11,17 +12,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import unquote
 
+import pyotp
+import segno
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from starlette.applications import Starlette
-from starlette.authentication import (
-    AuthCredentials,
-    AuthenticationBackend,
-    AuthenticationError,
-    SimpleUser,
-)
-from starlette.middleware import Middleware
-from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
 from starlette.templating import Jinja2Templates
 
@@ -35,6 +31,116 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 if not ADMIN_PASSWORD:
     ADMIN_PASSWORD = secrets.token_urlsafe(16)
     print(f"Generated admin password: {ADMIN_PASSWORD}")
+
+ADMIN_TOTP_SECRET = os.environ.get("ADMIN_TOTP_SECRET", "").strip().replace(" ", "").upper()
+ADMIN_SESSION_SECRET = os.environ.get("ADMIN_SESSION_SECRET", "").strip()
+
+SESSION_COOKIE = "hermes_admin_session"
+TOTP_PENDING_COOKIE = "hermes_totp_pending"
+SESSION_MAX_AGE = 7 * 24 * 3600
+TOTP_PENDING_MAX_AGE = 600
+
+
+def _session_signing_key() -> str:
+    if ADMIN_SESSION_SECRET:
+        return ADMIN_SESSION_SECRET
+    material = f"{ADMIN_USERNAME}\x00{ADMIN_PASSWORD}\x00hermes-admin-session-v1".encode()
+    return hashlib.sha256(material).hexdigest()
+
+
+_session_serializer = URLSafeTimedSerializer(_session_signing_key(), salt="hermes-admin-session")
+_totp_pending_serializer = URLSafeTimedSerializer(_session_signing_key(), salt="hermes-totp-pending")
+
+
+def totp_enabled() -> bool:
+    return bool(ADMIN_TOTP_SECRET)
+
+
+def _totp() -> pyotp.TOTP | None:
+    if not ADMIN_TOTP_SECRET:
+        return None
+    try:
+        return pyotp.TOTP(ADMIN_TOTP_SECRET)
+    except Exception:
+        return None
+
+
+def verify_totp_code(code: str) -> bool:
+    if not isinstance(code, str):
+        return False
+    digits = "".join(c for c in code.strip() if c.isdigit())
+    if len(digits) != 6:
+        return False
+    totp = _totp()
+    if not totp:
+        return False
+    return bool(totp.verify(digits, valid_window=1))
+
+
+def _set_session_cookie(response: Response, request: Request, username: str) -> None:
+    token = _session_serializer.dumps({"u": username})
+    secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https"
+    response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_MAX_AGE, path="/", httponly=True, samesite="lax", secure=secure)
+
+
+def _clear_session_cookies(response: Response) -> None:
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(TOTP_PENDING_COOKIE, path="/")
+
+
+def _set_totp_pending_cookie(response: Response, request: Request, username: str) -> None:
+    token = _totp_pending_serializer.dumps({"u": username})
+    secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https"
+    response.set_cookie(
+        TOTP_PENDING_COOKIE,
+        token,
+        max_age=TOTP_PENDING_MAX_AGE,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+    )
+
+
+def get_session_username(request: Request) -> str | None:
+    raw = request.cookies.get(SESSION_COOKIE)
+    if not raw:
+        return None
+    try:
+        data = _session_serializer.loads(raw, max_age=SESSION_MAX_AGE)
+        u = data.get("u")
+        if isinstance(u, str) and u == ADMIN_USERNAME:
+            return u
+    except (BadSignature, SignatureExpired, TypeError, KeyError):
+        pass
+    return None
+
+
+def get_totp_pending_username(request: Request) -> str | None:
+    raw = request.cookies.get(TOTP_PENDING_COOKIE)
+    if not raw:
+        return None
+    try:
+        data = _totp_pending_serializer.loads(raw, max_age=TOTP_PENDING_MAX_AGE)
+        u = data.get("u")
+        if isinstance(u, str) and u == ADMIN_USERNAME:
+            return u
+    except (BadSignature, SignatureExpired, TypeError, KeyError):
+        pass
+    return None
+
+
+def check_password(username: str, password: str) -> bool:
+    return username == ADMIN_USERNAME and password == ADMIN_PASSWORD
+
+
+def require_session(request: Request) -> Response | None:
+    if get_session_username(request):
+        return None
+    if request.url.path.startswith("/api"):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return RedirectResponse("/login", status_code=302)
+
 
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE_PATH = Path(HERMES_HOME) / ".env"
@@ -181,37 +287,6 @@ def merge_secrets(new_vars: dict[str, str], existing_vars: dict[str, str]) -> di
     return result
 
 
-class BasicAuthBackend(AuthenticationBackend):
-    async def authenticate(self, conn):
-        if "Authorization" not in conn.headers:
-            return None
-
-        auth = conn.headers["Authorization"]
-        try:
-            scheme, credentials = auth.split()
-            if scheme.lower() != "basic":
-                return None
-            decoded = base64.b64decode(credentials).decode("ascii")
-        except (ValueError, UnicodeDecodeError):
-            raise AuthenticationError("Invalid credentials")
-
-        username, _, password = decoded.partition(":")
-        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-            return AuthCredentials(["authenticated"]), SimpleUser(username)
-
-        raise AuthenticationError("Invalid credentials")
-
-
-def require_auth(request: Request):
-    if not request.user.is_authenticated:
-        return PlainTextResponse(
-            "Unauthorized",
-            status_code=401,
-            headers={"WWW-Authenticate": 'Basic realm="hermes"'},
-        )
-    return None
-
-
 class GatewayManager:
     def __init__(self):
         self.process: asyncio.subprocess.Process | None = None
@@ -298,8 +373,107 @@ gateway = GatewayManager()
 config_lock = asyncio.Lock()
 
 
+if ADMIN_TOTP_SECRET and _totp() is None:
+    print("WARNING: ADMIN_TOTP_SECRET is set but invalid for TOTP (expect base32). 2FA will not work until fixed.")
+
+
+async def login_page(request: Request):
+    if get_session_username(request):
+        return RedirectResponse("/", status_code=302)
+    if totp_enabled() and get_totp_pending_username(request):
+        return RedirectResponse("/totp", status_code=302)
+    err = request.query_params.get("error", "")
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {"error": err, "username_default": ADMIN_USERNAME},
+    )
+
+
+async def login_submit(request: Request):
+    if get_session_username(request):
+        return RedirectResponse("/", status_code=302)
+    form = await request.form()
+    username = (form.get("username") or "").strip()
+    password = (form.get("password") or "")
+    if not check_password(username, password):
+        return RedirectResponse("/login?error=1", status_code=302)
+    if totp_enabled():
+        resp = RedirectResponse("/totp", status_code=302)
+        _set_totp_pending_cookie(resp, request, username)
+        return resp
+    resp = RedirectResponse("/", status_code=302)
+    _set_session_cookie(resp, request, username)
+    return resp
+
+
+async def totp_page(request: Request):
+    if get_session_username(request):
+        return RedirectResponse("/", status_code=302)
+    if not totp_enabled():
+        return RedirectResponse("/login", status_code=302)
+    if not get_totp_pending_username(request):
+        return RedirectResponse("/login", status_code=302)
+    err = request.query_params.get("error", "")
+    totp = _totp()
+    if not totp:
+        return RedirectResponse("/login?error=1", status_code=302)
+    issuer = "Hermes Admin"
+    account = ADMIN_USERNAME
+    uri = totp.provisioning_uri(name=account, issuer_name=issuer)
+    return templates.TemplateResponse(
+        request,
+        "totp.html",
+        {"error": err, "issuer": issuer, "account": account},
+    )
+
+
+async def totp_qr_png(request: Request):
+    if not totp_enabled():
+        return PlainTextResponse("Not found", status_code=404)
+    if not get_totp_pending_username(request):
+        return PlainTextResponse("Unauthorized", status_code=401)
+    totp = _totp()
+    if not totp:
+        return PlainTextResponse("Not found", status_code=404)
+    uri = totp.provisioning_uri(name=ADMIN_USERNAME, issuer_name="Hermes Admin")
+    qr = segno.make(uri, error="m")
+    buf = io.BytesIO()
+    qr.save(buf, kind="png", scale=4)
+    return Response(content=buf.getvalue(), media_type="image/png")
+
+
+async def totp_submit(request: Request):
+    if get_session_username(request):
+        return RedirectResponse("/", status_code=302)
+    if not get_totp_pending_username(request):
+        return RedirectResponse("/login", status_code=302)
+    form = await request.form()
+    code = form.get("code") or ""
+    if not verify_totp_code(str(code)):
+        return RedirectResponse("/totp?error=1", status_code=302)
+    resp = RedirectResponse("/", status_code=302)
+    resp.delete_cookie(TOTP_PENDING_COOKIE, path="/")
+    _set_session_cookie(resp, request, ADMIN_USERNAME)
+    return resp
+
+
+async def logout(request: Request):
+    resp = RedirectResponse("/login", status_code=302)
+    _clear_session_cookies(resp)
+    return resp
+
+
+async def api_auth_status(request: Request):
+    return JSONResponse({
+        "authenticated": bool(get_session_username(request)),
+        "totp_enabled": totp_enabled(),
+        "totp_pending": bool(get_totp_pending_username(request)),
+    })
+
+
 async def homepage(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     return templates.TemplateResponse(request, "index.html")
@@ -310,7 +484,7 @@ async def health(request: Request):
 
 
 async def api_config_get(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     async with config_lock:
@@ -323,7 +497,7 @@ async def api_config_get(request: Request):
 
 
 async def api_config_put(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
 
@@ -355,7 +529,7 @@ async def api_config_put(request: Request):
 
 
 async def api_status(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
 
@@ -379,14 +553,14 @@ async def api_status(request: Request):
 
 
 async def api_logs(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     return JSONResponse({"lines": list(gateway.logs)})
 
 
 async def api_gateway_start(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     asyncio.create_task(gateway.start())
@@ -394,7 +568,7 @@ async def api_gateway_start(request: Request):
 
 
 async def api_gateway_stop(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     asyncio.create_task(gateway.stop())
@@ -402,7 +576,7 @@ async def api_gateway_stop(request: Request):
 
 
 async def api_gateway_restart(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     asyncio.create_task(gateway.restart())
@@ -437,7 +611,7 @@ def _pairing_platforms(suffix: str) -> list[str]:
 
 
 async def api_pairing_pending(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     now = time.time()
@@ -459,7 +633,7 @@ async def api_pairing_pending(request: Request):
 
 
 async def api_pairing_approve(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     try:
@@ -492,7 +666,7 @@ async def api_pairing_approve(request: Request):
 
 
 async def api_pairing_deny(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     try:
@@ -515,7 +689,7 @@ async def api_pairing_deny(request: Request):
 
 
 async def api_pairing_approved(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     results = []
@@ -532,7 +706,7 @@ async def api_pairing_approved(request: Request):
 
 
 async def api_pairing_revoke(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     try:
@@ -594,7 +768,7 @@ def _files_list_sync(abs_path: Path) -> dict:
 
 
 async def api_files_list(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     relpath = request.query_params.get("path", "")
@@ -615,7 +789,7 @@ async def api_files_list(request: Request):
 
 
 async def api_files_read(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     relpath = request.query_params.get("path", "")
@@ -652,7 +826,7 @@ async def api_files_read(request: Request):
 
 
 async def api_files_save(request: Request):
-    auth_err = require_auth(request)
+    auth_err = require_session(request)
     if auth_err:
         return auth_err
     try:
@@ -710,6 +884,13 @@ async def auto_start_gateway():
 
 
 routes = [
+    Route("/login", login_page, methods=["GET"]),
+    Route("/login", login_submit, methods=["POST"]),
+    Route("/totp", totp_page, methods=["GET"]),
+    Route("/totp", totp_submit, methods=["POST"]),
+    Route("/totp/qr.png", totp_qr_png, methods=["GET"]),
+    Route("/logout", logout, methods=["POST"]),
+    Route("/api/auth/status", api_auth_status, methods=["GET"]),
     Route("/", homepage),
     Route("/health", health),
     Route("/api/config", api_config_get, methods=["GET"]),
@@ -738,7 +919,6 @@ async def lifespan(app):
 
 app = Starlette(
     routes=routes,
-    middleware=[Middleware(AuthenticationMiddleware, backend=BasicAuthBackend())],
     lifespan=lifespan,
 )
 

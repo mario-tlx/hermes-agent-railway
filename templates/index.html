@@ -34,9 +34,16 @@
               :class="status.gateway?.state === 'running' ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400' : status.gateway?.state === 'error' ? 'bg-red-500/20 text-red-600 dark:text-red-400' : 'bg-gray-200 text-gray-500 dark:bg-gray-700 dark:text-gray-400'"
               x-text="status.gateway?.state || 'unknown'"></span>
       </div>
-      <button @click="restartGateway()" class="text-sm px-3 py-1.5 bg-gray-200 hover:bg-gray-300 dark:bg-gray-800 dark:hover:bg-gray-700 rounded-lg transition">
-        Restart Gateway
-      </button>
+      <div class="flex items-center gap-2">
+        <form method="post" action="/logout">
+          <button type="submit" class="text-sm px-3 py-1.5 text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-200 border border-gray-300 dark:border-gray-600 rounded-lg transition">
+            Sign out
+          </button>
+        </form>
+        <button @click="restartGateway()" class="text-sm px-3 py-1.5 bg-gray-200 hover:bg-gray-300 dark:bg-gray-800 dark:hover:bg-gray-700 rounded-lg transition">
+          Restart Gateway
+        </button>
+      </div>
     </header>
 
     <div class="flex gap-1 mb-6 border-b border-gray-200 dark:border-gray-800">
@@ -574,6 +581,16 @@
           return this.filesPath ? this.filesPath.split('/').filter(Boolean) : [];
         },
 
+        async apiFetch(url, options = {}) {
+          const opts = { credentials: 'same-origin', ...options };
+          const res = await fetch(url, opts);
+          if (res.status === 401) {
+            window.location.href = '/login';
+            return res;
+          }
+          return res;
+        },
+
         providers: [
           { key: 'OPENROUTER_API_KEY', label: 'OpenRouter' },
           { key: 'DEEPSEEK_API_KEY', label: 'DeepSeek' },
@@ -608,7 +625,7 @@
 
         async loadConfig() {
           try {
-            const res = await fetch('/api/config');
+            const res = await this.apiFetch('/api/config');
             if (res.ok) {
               const data = await res.json();
               this.vars = data.vars || {};
@@ -624,7 +641,7 @@
               vars: JSON.parse(JSON.stringify(this.vars)),
               _restartGateway: this.restartAfterSave,
             };
-            const res = await fetch('/api/config', {
+            const res = await this.apiFetch('/api/config', {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload),
@@ -649,14 +666,14 @@
 
         async loadStatus() {
           try {
-            const res = await fetch('/api/status');
+            const res = await this.apiFetch('/api/status');
             if (res.ok) this.status = await res.json();
           } catch (e) {}
         },
 
         async loadLogs() {
           try {
-            const res = await fetch('/api/logs');
+            const res = await this.apiFetch('/api/logs');
             if (res.ok) {
               const data = await res.json();
               const wasAtBottom = this.$refs.logViewer &&
@@ -672,19 +689,19 @@
         },
 
         async startGateway() {
-          await fetch('/api/gateway/start', { method: 'POST' });
+          await this.apiFetch('/api/gateway/start', { method: 'POST' });
           this.showToast('Gateway starting', 'success');
           setTimeout(() => this.loadStatus(), 1000);
         },
 
         async stopGateway() {
-          await fetch('/api/gateway/stop', { method: 'POST' });
+          await this.apiFetch('/api/gateway/stop', { method: 'POST' });
           this.showToast('Gateway stopping', 'success');
           setTimeout(() => this.loadStatus(), 1000);
         },
 
         async restartGateway() {
-          await fetch('/api/gateway/restart', { method: 'POST' });
+          await this.apiFetch('/api/gateway/restart', { method: 'POST' });
           this.showToast('Gateway restarting', 'success');
           setTimeout(() => this.loadStatus(), 2000);
         },
@@ -692,8 +709,8 @@
         async loadPairing() {
           try {
             const [pendingRes, approvedRes] = await Promise.all([
-              fetch('/api/pairing/pending'),
-              fetch('/api/pairing/approved'),
+              this.apiFetch('/api/pairing/pending'),
+              this.apiFetch('/api/pairing/approved'),
             ]);
             if (pendingRes.ok) this.pendingUsers = (await pendingRes.json()).pending || [];
             if (approvedRes.ok) this.approvedUsers = (await approvedRes.json()).approved || [];
@@ -701,7 +718,7 @@
         },
 
         async approveUser(platform, code) {
-          const res = await fetch('/api/pairing/approve', {
+          const res = await this.apiFetch('/api/pairing/approve', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ platform, code }),
@@ -716,7 +733,7 @@
         },
 
         async denyUser(platform, code) {
-          const res = await fetch('/api/pairing/deny', {
+          const res = await this.apiFetch('/api/pairing/deny', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ platform, code }),
@@ -729,7 +746,7 @@
 
         async revokeUser(platform, user_id) {
           if (!confirm('Revoke access for this user?')) return;
-          const res = await fetch('/api/pairing/revoke', {
+          const res = await this.apiFetch('/api/pairing/revoke', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ platform, user_id }),
@@ -775,7 +792,7 @@
           this.filesEntries = [];
           const q = relpath ? `?path=${encodeURIComponent(relpath)}` : '';
           try {
-            const res = await fetch(`/api/files/list${q}`);
+            const res = await this.apiFetch(`/api/files/list${q}`);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
               this.filesListError = data.error || `List failed (${res.status})`;
@@ -794,7 +811,7 @@
           this.filePreview = { path: '', draft: '', baseline: '', size: 0, loading: true, error: '', saving: false };
           const q = `?path=${encodeURIComponent(relpath)}`;
           try {
-            const res = await fetch(`/api/files/read${q}`);
+            const res = await this.apiFetch(`/api/files/read${q}`);
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
               this.filePreview = {
@@ -840,7 +857,7 @@
           if (!this.filePreview.path || this.filePreview.saving) return;
           this.filePreview.saving = true;
           try {
-            const res = await fetch('/api/files/save', {
+            const res = await this.apiFetch('/api/files/save', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ path: this.filePreview.path, content: this.filePreview.draft }),
