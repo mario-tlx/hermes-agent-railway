@@ -116,6 +116,9 @@ def show_totp_qr() -> bool:
     if enrolled is None:
         return True
     return enrolled != totp_secret_fingerprint()
+
+
+def _set_session_cookie(response: Response, request: Request, username: str) -> None:
     token = _session_serializer.dumps({"u": username})
     secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https"
     response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_MAX_AGE, path="/", httponly=True, samesite="lax", secure=secure)
