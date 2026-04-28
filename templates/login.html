@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in — Hermes Agent</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: 'class' };
+    if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+      document.documentElement.classList.add('dark');
+    }
+  </script>
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-100 min-h-screen flex items-center justify-center px-4">
+  <div class="w-full max-w-md bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-xl shadow-sm p-8">
+    <h1 class="text-xl font-semibold tracking-tight mb-1">Hermes Agent</h1>
+    <p class="text-sm text-gray-500 dark:text-gray-400 mb-6">Sign in to the admin panel</p>
+    {% if error %}
+    <p class="text-sm text-red-600 dark:text-red-400 mb-4">Invalid username or password.</p>
+    {% endif %}
+    <form method="post" action="/login" class="space-y-4">
+      <div>
+        <label class="block text-xs text-gray-500 mb-1">Username</label>
+        <input type="text" name="username" value="{{ username_default }}" autocomplete="username"
+               class="w-full bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500" required>
+      </div>
+      <div>
+        <label class="block text-xs text-gray-500 mb-1">Password</label>
+        <input type="password" name="password" autocomplete="current-password"
+               class="w-full bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500" required>
+      </div>
+      <button type="submit" class="w-full py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition">
+        Continue
+      </button>
+    </form>
+  </div>
+</body>
+</html>
