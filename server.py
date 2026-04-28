@@ -74,10 +74,48 @@ def verify_totp_code(code: str) -> bool:
     totp = _totp()
     if not totp:
         return False
-    return bool(totp.verify(digits, valid_window=1))
+    try:
+        return bool(totp.verify(digits, valid_window=1))
+    except Exception:
+        return False
 
 
-def _set_session_cookie(response: Response, request: Request, username: str) -> None:
+def totp_secret_fingerprint() -> str:
+    """Stable id for the current ADMIN_TOTP_SECRET (for enrollment tracking)."""
+    return hashlib.sha256(ADMIN_TOTP_SECRET.encode("utf-8")).hexdigest()
+
+
+def _read_totp_enrolled_fingerprint() -> str | None:
+    if not TOTP_STATE_PATH.exists():
+        return None
+    try:
+        data = json.loads(TOTP_STATE_PATH.read_text(encoding="utf-8"))
+        fp = data.get("enrolled_secret_fp")
+        return fp if isinstance(fp, str) and len(fp) == 64 else None
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def _mark_totp_enrolled() -> None:
+    TOTP_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TOTP_STATE_PATH.write_text(
+        json.dumps({"enrolled_secret_fp": totp_secret_fingerprint()}, indent=0),
+        encoding="utf-8",
+    )
+    try:
+        os.chmod(TOTP_STATE_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def show_totp_qr() -> bool:
+    """Show provisioning QR only until this secret has been verified once (or after secret rotation)."""
+    if not totp_enabled() or _totp() is None:
+        return False
+    enrolled = _read_totp_enrolled_fingerprint()
+    if enrolled is None:
+        return True
+    return enrolled != totp_secret_fingerprint()
     token = _session_serializer.dumps({"u": username})
     secure = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https"
     response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_MAX_AGE, path="/", httponly=True, samesite="lax", secure=secure)
@@ -144,6 +182,7 @@ def require_session(request: Request) -> Response | None:
 
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE_PATH = Path(HERMES_HOME) / ".env"
+TOTP_STATE_PATH = Path(HERMES_HOME) / ".admin_totp_state.json"
 PAIRING_DIR = Path(HERMES_HOME) / "pairing"
 HERMES_ROOT = Path(HERMES_HOME).expanduser().resolve()
 CODE_TTL_SECONDS = 3600
@@ -424,7 +463,12 @@ async def totp_page(request: Request):
     return templates.TemplateResponse(
         request,
         "totp.html",
-        {"error": err, "issuer": issuer, "account": account},
+        {
+            "error": err,
+            "issuer": issuer,
+            "account": account,
+            "show_qr": show_totp_qr(),
+        },
     )
 
 
@@ -433,6 +477,8 @@ async def totp_qr_png(request: Request):
         return PlainTextResponse("Not found", status_code=404)
     if not get_totp_pending_username(request):
         return PlainTextResponse("Unauthorized", status_code=401)
+    if not show_totp_qr():
+        return PlainTextResponse("Not found", status_code=404)
     totp = _totp()
     if not totp:
         return PlainTextResponse("Not found", status_code=404)
@@ -452,6 +498,7 @@ async def totp_submit(request: Request):
     code = form.get("code") or ""
     if not verify_totp_code(str(code)):
         return RedirectResponse("/totp?error=1", status_code=302)
+    _mark_totp_enrolled()
     resp = RedirectResponse("/", status_code=302)
     resp.delete_cookie(TOTP_PENDING_COOKIE, path="/")
     _set_session_cookie(resp, request, ADMIN_USERNAME)

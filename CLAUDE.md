@@ -15,3 +15,4 @@ Python/Starlette web server that wraps Hermes Agent's gateway as a managed subpr
 - Secret masking: password fields show first 8 chars + `***`, merge on save preserves masked values
 - No direct Hermes Python imports — the server manages the .env file independently
 - Auto-start: gateway starts on server boot if any provider API key is configured
+- TOTP 2FA: provisioning QR is shown only until the first successful verification for the current `ADMIN_TOTP_SECRET`; state file `.admin_totp_state.json` under `HERMES_HOME`
